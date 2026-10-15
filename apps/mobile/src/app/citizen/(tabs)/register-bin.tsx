@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
-import { Plus, MapPin, Crosshair, Info, CheckCircle2, QrCode, X, ShieldCheck } from "lucide-react-native";
+import { router, useLocalSearchParams } from "expo-router";
+import { Plus, MapPin, Crosshair, Info, CheckCircle2, QrCode, X, ShieldCheck, Zap } from "lucide-react-native";
 import MapView, { Marker } from "react-native-maps";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useAuthStore } from "@/lib/store/auth-store";
@@ -41,6 +42,14 @@ export default function RegisterBin() {
   const [pinned, setPinned] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const params = useLocalSearchParams<{ deviceId?: string; pairingCode?: string }>();
+
+  // Returning from the in-app provisioning flow prefills the device fields.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: sync nav params into form state
+    if (params.deviceId) setDeviceId(String(params.deviceId));
+    if (params.pairingCode) setPairingCode(String(params.pairingCode));
+  }, [params.deviceId, params.pairingCode]);
 
   const myBins = bins.filter((b) => b.submittedBy === user?.id);
 
@@ -124,6 +133,19 @@ export default function RegisterBin() {
           </View>
         </View>
       )}
+
+      <Card className="border-emerald-500/25">
+        <CardContent className="flex-row items-center justify-between gap-3 p-4">
+          <View className="min-w-0 flex-1">
+            <Text className="font-semibold text-foreground">New device?</Text>
+            <Text className="text-sm text-muted-foreground">Connect it to WiFi and calibrate — all from the app</Text>
+          </View>
+          <Button onPress={() => router.push("/citizen/provision")} variant="outline" className="border-emerald-500/40">
+            <Zap size={16} color="#16a34a" />
+            <Text className="text-sm font-semibold text-emerald-600">Set up device</Text>
+          </Button>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
