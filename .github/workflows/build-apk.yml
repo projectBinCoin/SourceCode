@@ -1,0 +1,157 @@
+name: Build mobile apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # The ubuntu runner ships the Android SDK preinstalled (licenses accepted);
+      # gradle downloads the platform/build-tools it needs.
+      - name: Build environment
+        run: |
+          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
+          echo "GRADLE_OPTS=-Dorg.gradle.jvmargs=-Xmx4g" >> "$GITHUB_ENV"
+
+      - name: Create .env from secrets (never committed)
+        run: |
+          echo "EXPO_PUBLIC_SUPABASE_URL=${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}" >> .env
+          echo "EXPO_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}" >> .env
+          echo "EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=${{ secrets.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY }}" >> .env
+
+      - name: Inject Google Maps key into app.json (from secrets)
+        run: |
+          node -e "const fs=require('fs');const p='app.json';const d=JSON.parse(fs.readFileSync(p));d.expo.android=d.expo.android||{};d.expo.android.config=d.expo.android.config||{};d.expo.android.config.googleMaps={apiKey:process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY};fs.writeFileSync(p,JSON.stringify(d,null,2));"
+        env:
+          EXPO_PUBLIC_GOOGLE_MAPS_API_KEY: ${{ secrets.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and lint
+        run: |
+          npx tsc --noEmit
+          npx eslint src
+
+      - name: Generate native Android project
+        run: npx expo prebuild -p android --no-install
+
+      - name: Build release APK
+        run: cd android && ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bincoin-apk
+          path: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Attach APK to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+          name: Bincoin ${{ github.ref_name }}
+          body: |
+            Bincoin mobile app builds.
+
+            - `app-release.apk` — Android release APK (universal). Download and
+              open it on your Android phone (allow "install from unknown
+              sources" when prompted).
+            - `Bincoin-iOS-Simulator.app.zip` — iOS Simulator build. Runs in the
+              iOS Simulator (Xcode). A physical-device IPA requires an Apple
+              Developer account for signing.
+
+            The app connects to the shared Bincoin Supabase backend.
+
+  build-ios:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - name: Create .env from secrets (never committed)
+        run: |
+          echo "EXPO_PUBLIC_SUPABASE_URL=${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}" >> .env
+          echo "EXPO_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}" >> .env
+          echo "EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=${{ secrets.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY }}" >> .env
+
+      - name: Inject Google Maps key into app.json (from secrets)
+        run: |
+          node -e "const fs=require('fs');const p='app.json';const d=JSON.parse(fs.readFileSync(p));d.expo.android=d.expo.android||{};d.expo.android.config=d.expo.android.config||{};d.expo.android.config.googleMaps={apiKey:process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY};fs.writeFileSync(p,JSON.stringify(d,null,2));"
+        env:
+          EXPO_PUBLIC_GOOGLE_MAPS_API_KEY: ${{ secrets.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and lint
+        run: |
+          npx tsc --noEmit
+          npx eslint src
+
+      - name: Generate native iOS project
+        run: npx expo prebuild -p ios --no-install
+
+      - name: Install CocoaPods deps
+        run: cd ios && pod install
+
+      - name: Build iOS Simulator app
+        run: |
+          cd ios && xcodebuild \
+            -workspace Bincoin.xcworkspace \
+            -scheme Bincoin \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ../ios-build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Zip the .app bundle
+        run: |
+          cd ios-build/Build/Products/Release-iphonesimulator && \
+          ditto -c -k --sequesterRsrc --keepParent Bincoin.app ../../../../Bincoin-iOS-Simulator.app.zip
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bincoin-ios
+          path: apps/mobile/Bincoin-iOS-Simulator.app.zip
+
+      - name: Attach iOS app to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/mobile/Bincoin-iOS-Simulator.app.zip
+          name: Bincoin ${{ github.ref_name }}

@@ -1,0 +1,18 @@
+{
+  "name": "Bincoin — Smart Waste Management",
+  "short_name": "Bincoin",
+  "description": "Smart Waste Management PWA — Book pickups, earn rewards, manage collections.",
+  "start_url": "/login",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050A10",
+  "theme_color": "#0099FF",
+  "icons": [
+    {
+      "src": "/brand/logo.jpg",
+      "sizes": "1600x1600",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    }
+  ]
+}
