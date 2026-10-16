@@ -5,10 +5,12 @@ Self-provisioning firmware for the registered smart bins: an **ESP32** reads the
 ## How a bin comes online (user flow)
 
 1. **Power on** — the bin can't join any WiFi yet, so it starts a hotspot: **`BINCOIN-SETUP-XXXXXX`**.
-2. **Phone → connect to that hotspot** — a setup page opens automatically (captive portal) at `http://192.168.4.1`.
-3. **Fill it in**: home WiFi name + password, and the **pairing code** printed on the bin sticker. Press **"Calibrate Now"** *with the bin empty* — the sensor measures the inside height itself and stores it.
-4. **Save & Connect** — the bin joins your WiFi and starts reporting every 15 minutes.
-5. **In the app** → Register Bin → **Scan QR** on the sticker → the device ID + pairing code fill themselves → label, pin the location, submit for admin approval.
+2. **In the app** → Register Bin → **Set up device** → tap **Connect to device WiFi** (the picker opens inside the app) and join the BINCOIN network.
+3. The app reads the **device ID straight off the bin** and **generates the pairing code itself** — nothing to type.
+4. Enter the home WiFi name + password → press **Calibrate** *with the bin empty* → the sensor measures the inside height itself → **Send setup**.
+5. The bin joins your WiFi and starts reporting every 15 minutes. Finish registration in the app — device ID + pairing are prefilled; add a label, pin the location, submit for admin approval.
+
+Manual fallback: the captive portal at `http://192.168.4.1` is still there — connect a laptop/phone to the hotspot and the same fields work in any browser.
 
 The admin approval card shows the **sensor-measured inside height** — the device proves its own geometry, so a tall-thin bin or short-wide bin is verified before approval rather than trusting a guessed size.
 
@@ -66,6 +68,7 @@ The admin approval card shows the **sensor-measured inside height** — the devi
 - **Factory reset:** hold the **BOOT button (GPIO0) for 3 s** at power-on → wipes saved WiFi/pairing/height → back to setup portal.
 - **Re-calibrate:** empty the bin → hold BOOT 3 s → setup portal → *Calibrate Now* (or use the admin *Recalibrate* action, which the device picks up on its next wake).
 - **Setup timeout:** the portal stays up for 10 minutes; if nobody connects, the bin sleeps a minute and retries on the next wake.
+- **WiFi self-recovery:** if the saved network stops working (password/router change), the bin counts 4 failed connections (~1 h), forgets only the WiFi credentials, and reopens the setup portal — calibration and pairing survive. The app flags the bin "Offline — reconnect" so the owner can push new credentials from Register Bin.
 
 ## Security notes
 

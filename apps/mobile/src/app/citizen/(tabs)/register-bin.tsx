@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
 import { router, useLocalSearchParams } from "expo-router";
-import { Plus, MapPin, Crosshair, Info, CheckCircle2, QrCode, X, ShieldCheck, Zap } from "lucide-react-native";
+import { Plus, MapPin, Crosshair, Info, CheckCircle2, QrCode, X, ShieldCheck, Zap, WifiOff } from "lucide-react-native";
 import MapView, { Marker } from "react-native-maps";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useAuthStore } from "@/lib/store/auth-store";
@@ -52,6 +52,11 @@ export default function RegisterBin() {
   }, [params.deviceId, params.pairingCode]);
 
   const myBins = bins.filter((b) => b.submittedBy === user?.id);
+
+  // A bin is offline when it misses ~2 telemetry cycles (firmware pings every 15 min).
+  const binOffline = (bin: (typeof bins)[number]) =>
+    // eslint-disable-next-line react-hooks/purity -- deliberate snapshot: staleness relative to render time
+    !bin.lastPingAt || Date.now() - new Date(bin.lastPingAt).getTime() > 40 * 60 * 1000;
 
   const pinMyLocation = async () => {
     setGeo("locating");
@@ -338,10 +343,24 @@ export default function RegisterBin() {
                     <Text className="text-xs text-amber-600 dark:text-amber-400">⏳ Pending</Text>
                   </Badge>
                 )}
-                {bin.approvalStatus === "approved" && (
+                {bin.approvalStatus === "approved" && !binOffline(bin) && (
                   <Badge variant="outline" className="border-green-500/40">
                     <Text className="text-xs text-green-600 dark:text-green-400">✓ Approved</Text>
                   </Badge>
+                )}
+                {bin.approvalStatus === "approved" && binOffline(bin) && (
+                  <Pressable
+                    onPress={() =>
+                      router.push({
+                        pathname: "/citizen/provision",
+                        params: { deviceId: bin.deviceId, pairingCode: bin.pairingCode ?? "", mode: "reconfigure" },
+                      })
+                    }
+                    className="flex-row items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5"
+                  >
+                    <WifiOff size={12} color="#e5484d" />
+                    <Text className="text-xs font-semibold text-destructive">Offline — reconnect</Text>
+                  </Pressable>
                 )}
                 {bin.approvalStatus === "rejected" && (
                   <Badge variant="outline" className="border-red-500/40">

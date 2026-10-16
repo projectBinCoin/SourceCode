@@ -233,7 +233,8 @@ void portalRoot() {
 void portalSave() {
   prefs.putString("ssid", portal.arg("ssid"));
   prefs.putString("pass", portal.arg("pass"));
-  prefs.putString("pair", portal.arg("pair"));
+  String pair = portal.arg("pair");
+  if (pair.length()) prefs.putString("pair", pair);   // keep existing pairing when not sent (WiFi-only reconfigure)
   portal.send(200, "text/html", String(PORTAL_HTML_HEAD) +
     "<h1>Saved</h1><p>Rebooting — the bin joins your WiFi and starts reporting.<br>Now register it in the app: scan the QR sticker.</p>");
   delay(1500);
@@ -304,6 +305,7 @@ void setup() {
   }
 
   if (connectSavedWiFi()) {
+    prefs.putUChar("wifiFails", 0);            // healthy link — reset the failure counter
     float airGap = medianDistance(SENSOR_SAMPLES);
     if (airGap < 0) airGap = MAX_RANGE_CM;  // no echo → treat as empty
     int battery = BATTERY_ENABLED ? batteryPercent(readBatteryVoltage()) : 0;
@@ -324,7 +326,18 @@ void setup() {
       }
     }
   } else {
-    Serial.println("WiFi unreachable — will retry next wake.");
+    // Persistent failure (password/router changed) → drop credentials so the
+    // next wake reopens the setup portal. Calibration + pairing are kept.
+    int fails = prefs.getUChar("wifiFails", 0) + 1;
+    prefs.putUChar("wifiFails", fails);
+    Serial.printf("WiFi unreachable — failure %d\n", fails);
+    if (fails >= 4) {
+      Serial.println("Forgetting WiFi — will reopen setup portal next wake.");
+      prefs.remove("ssid");
+      prefs.remove("pass");
+      prefs.putUChar("wifiFails", 0);
+      goToSleep(60);
+    }
   }
 
   goToSleep(SLEEP_SECONDS);
