@@ -1,0 +1,158 @@
+# Bincoin — Smart Waste Management Platform
+
+One platform, three surfaces, one backend:
+
+```
+bincoin/
+├── apps/
+│   ├── web/        # Next.js 16 static-export PWA → Cloudflare Pages
+│   └── mobile/     # React Native (Expo SDK 57) app → APK/iOS via GitHub Actions
+├── firmware/       # ESP32 smart-bin firmware (self-provisioning + self-calibrating)
+│   └── tools/      # QR sticker generator for fleet provisioning
+├── supabase/       # Database schema + migrations (tables, RLS, telemetry RPC)
+└── README.md
+```
+
+## System architecture
+
+```mermaid
+flowchart TB
+    subgraph SURFACES["Client surfaces"]
+        WEB["🌐 Web PWA<br/>Next.js 16 static export<br/>→ Cloudflare Pages"]
+        MOB["📱 Mobile app<br/>Expo SDK 57 / React Native<br/>→ APK + iOS via GitHub Actions"]
+    end
+
+    subgraph SB["Supabase"]
+        AUTH["Auth<br/>email + password"]
+        DB[("Postgres<br/>app_users · collectors · bins<br/>pickup_requests · transactions<br/>vouchers · settings")]
+        RPC[["update_bin_telemetry<br/>pairing-gated RPC"]]
+    end
+
+    subgraph FLEET["ESP32 bin fleet"]
+        ESP["📟 HC-SR04 + battery<br/>MAC-derived device ID<br/>captive-portal setup<br/>self-calibrating height<br/>deep sleep · 60 s pings"]
+    end
+
+    MAPS["Google Maps Platform"]
+
+    WEB <-->|"HTTPS — auth + queries + mutations"| SB
+    MOB <-->|"HTTPS — same API surface"| SB
+    MOB -.->|"scan bin QR<br/>device id + pairing code"| ESP
+    ESP -->|"fill% · battery · air gap<br/>height · pairing_code"| RPC
+    RPC --> DB
+    DB -->|"recalibrate flag"| ESP
+    WEB --> MAPS
+    MOB --> MAPS
+```
+
+```mermaid
+flowchart LR
+    subgraph ACTORS["Use cases"]
+        CIT(["👤 Citizen"]) --> C1["Scan QR → register bin"]
+        CIT --> C2[Book & track pickups]
+        CIT --> C3[Earn points · redeem vouchers]
+        CIT --> C4[Profile & history]
+
+        COL(["🚚 Collector"]) --> D1[Nearby jobs · 5 km radius]
+        COL --> D2[Claim · navigate · verify]
+        COL --> D3[History & penalties]
+
+        ADM(["🛡️ Admin"]) --> A1["Approve bins — sensor-verified"]
+        ADM --> A2[Manage collectors]
+        ADM --> A3[Audit log · settings · vouchers]
+        ADM --> A4[Trigger recalibration]
+    end
+```
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant App as Web / Mobile
+    participant SB as Supabase
+    participant ESP as ESP32 bin
+    actor A as Admin
+
+    U->>ESP: Connect to BINCOIN-SETUP hotspot → WiFi creds + pairing code
+    U->>ESP: Calibrate (bin empty) → sensor stores bin_height_cm
+    U->>App: Register bin — scan QR (auto-fills device id + pairing)
+    App->>SB: INSERT bins (pending)
+    ESP->>SB: Telemetry + self-measured height (pairing-gated RPC)
+    A->>App: Pending card shows sensor-verified height → Approve
+    App->>SB: approval_status = approved
+    loop every 60 s (900 s on battery)
+        ESP->>SB: fill% · battery · air gap
+        SB-->>ESP: { ok, recalibrate } — admin flag → re-calibrate
+    end
+```
+
+### Client layer (web + mobile — identical logic, two runtimes)
+
+- **Reads**: TanStack Query hooks → `lib/supabase-data.ts` → PostgREST. Zustand store is only an optimistic/demo fallback when Supabase is unconfigured — never the source of truth.
+- **Writes**: `lib/hooks/mutations.ts` → targeted Supabase `update/insert/delete` by row id → `invalidateQueries` refreshes the UI. Errors surface as toasts/alerts.
+- **Auth**: Supabase Auth sessions + `app_users` role profile (citizen / collector / admin). Route guards redirect by role; pending collectors land on an approval-waiting screen.
+- **Points**: pure function `lib/points.ts` — same `calcPoints` on both apps.
+
+### Hardware layer (ESP32 fleet)
+
+Zero per-bin code edits — one firmware image for the whole fleet:
+
+1. **Identity** — device ID derived from the chip MAC (`ESP32-A1B2C3`); the device generates its own pairing code (`BINC-XXXXXX`) and shows both as one copyable device code on its setup page.
+2. **Provisioning** — first boot opens a `BINCOIN-SETUP-XXXX` captive portal: user enters home WiFi + the pairing code, then presses *Calibrate* with the bin empty.
+3. **Self-calibration** — median of 15 ultrasonic reads becomes `bin_height_cm` (stored in flash + reported to the DB). The admin approval card shows this sensor-measured height — the bin proves its own geometry.
+4. **Telemetry** — every 60 s (900 s on battery): `fill% = (1 − airGap/height) × 100` + battery + air gap → `update_bin_telemetry` RPC. Writes without a matching `pairing_code` are rejected (legacy bins with no code stay open).
+5. **Remote recalibration** — admin presses *Recalibrate* → sets `recalibrate_requested` → the RPC response tells the device → it re-measures and reports the new height.
+6. **Recovery** — hold BOOT (GPIO0) 3 s → factory reset → back to the setup portal.
+
+### Deploy targets
+
+| Surface | Pipeline | Output |
+|---|---|---|
+| Web | `next build` (`output: export`) → Cloudflare Pages | `bincoin.pages.dev` |
+| Mobile Android | GitHub Actions `build-apk.yml` on `v*` tag → `expo prebuild` + Gradle | APK attached to the GitHub release |
+| Mobile iOS | Same workflow → simulator build | `.app` artifact on the release |
+| Database | SQL applied in Supabase SQL Editor | `supabase/supabase/migrations/*.sql` |
+
+| App | Stack | Repo path |
+|---|---|---|
+| Web PWA | Next.js 16 App Router, TypeScript, Tailwind v4, base-ui, TanStack Query, Zustand | `apps/web` |
+| Mobile | Expo SDK 57, Expo Router, NativeWind, react-native-maps, expo-location, expo-camera | `apps/mobile` |
+| Firmware | Arduino C++ — ESP32, HC-SR04, WiFi captive portal, NVS, deep sleep | `firmware/firmware/bincoin_bin` |
+| Database | Supabase Postgres + Auth — `supabase/supabase/schema.sql` | `supabase` |
+
+## Features
+
+- **Citizen** — register smart bins by scanning the device QR (pairing-locked), book pickups (4-step wizard), track requests live, earn points, redeem vouchers with QR codes
+- **Collector** — live GPS tracking with a 5 km job radius, claim jobs, navigation, verify collections (match / mismatch / invalid + photo evidence), job history
+- **Admin** — live bin telemetry map, collector approvals, bin registry + approvals (with sensor-verified heights), bin recalibration, audit log, point-engine + voucher configuration
+- **Hardware** — self-provisioning ESP32 bins; the DB stamps ping times (no NTP needed)
+
+## Documentation
+
+- Full platform docs + UML diagrams: [`apps/web/README.md`](apps/web/README.md)
+- Mobile app docs: [`apps/mobile/README.md`](apps/mobile/README.md)
+- Firmware wiring & provisioning: [`firmware/firmware/README.md`](firmware/firmware/README.md)
+- Database schema: [`supabase/supabase/schema.sql`](supabase/supabase/schema.sql)
+- IoT pairing migration: [`supabase/supabase/migrations/002_iot_pairing.sql`](supabase/supabase/migrations/002_iot_pairing.sql)
+
+## Quick start
+
+```bash
+# Web (local dev)
+cd apps/web && npm install && cp .env.local.example .env.local  # fill in keys
+npm run dev
+
+# Mobile
+cd apps/mobile && npm install && cp .env.example .env           # fill in keys
+npx expo start
+
+# Web — deploy preview in the Workers runtime
+cd apps/web && npm run preview
+```
+
+## Security
+
+- `.env*` files are gitignored in both apps; only placeholder examples are committed
+- The Supabase `service_role` secret is server-only and never bundled or committed
+- Build secrets (Supabase + Maps keys) live in GitHub Actions secrets / Cloudflare env vars — injected at build time, never in the repo
+- Bin telemetry requires the per-bin `pairing_code` — a leaked device ID alone can't inject data
+- A pre-commit hook blocks commits containing API keys/JWTs
+- RLS is enabled on all tables (demo-phase permissive — tighten before public production)

@@ -1,0 +1,576 @@
+import { useEffect, useRef, useState } from "react";
+import { Modal, Pressable, ScrollView, Text, View } from "react-native";
+import { router, useLocalSearchParams } from "expo-router";
+import { Plus, MapPin, Crosshair, Info, CheckCircle2, QrCode, X, ShieldCheck, Zap, WifiOff, Wifi, Pencil } from "lucide-react-native";
+import MapView, { Marker } from "react-native-maps";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import { useAuthStore } from "@/lib/store/auth-store";
+import { useBins, useAnnouncedDevices } from "@/lib/hooks/queries";
+import { useSubmitBin, useClaimDevice } from "@/lib/hooks/mutations";
+import type { AnnouncedDevice } from "@/lib/supabase-data";
+import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Badge } from "@/components/ui";
+import { BIN_SIZES, MAP_CENTER, WASTAGE_TYPES, WASTAGE_META } from "@/lib/constants";
+import type { BinSize, WastageType } from "@/types";
+import * as Location from "expo-location";
+
+/** QR stickers carry "BINCOIN|<deviceId>|<pairingCode>" — plain device IDs also accepted. */
+function parseDeviceQr(raw: string): { deviceId: string; pairingCode: string } | null {
+  const parts = raw.trim().split("|");
+  if (parts[0] === "BINCOIN" && parts[1]) {
+    return { deviceId: parts[1], pairingCode: parts[2] ?? "" };
+  }
+  if (/^ESP32-[0-9A-Fa-f]{6}$/.test(raw.trim())) return { deviceId: raw.trim().toUpperCase(), pairingCode: "" };
+  return null;
+}
+
+/** The device portal shows one copy-pastable line: "ESP32-XXXXXX|BINC-XXXXXX". */
+function parseDeviceCode(raw: string): { deviceId: string; pairingCode: string } | null {
+  const m = raw.match(/ESP32-[0-9A-F]{6}/i);
+  if (!m) return null;
+  const p = raw.match(/BINC-[0-9A-F]{6}/i);
+  return { deviceId: m[0].toUpperCase(), pairingCode: p ? p[0].toUpperCase() : "" };
+}
+
+export default function RegisterBin() {
+  const user = useAuthStore((s) => s.user);
+  const { data: bins = [] } = useBins();
+  const { data: announced = [] } = useAnnouncedDevices();
+  const submitBin = useSubmitBin();
+  const claimDevice = useClaimDevice();
+  const mapRef = useRef<MapView>(null);
+
+  const [deviceId, setDeviceId] = useState("");
+  const [pairingCode, setPairingCode] = useState("");
+  const [label, setLabel] = useState("");
+  const [sizeL, setSizeL] = useState<BinSize>(100);
+  const [wasteType, setWasteType] = useState<WastageType>("Plastic");
+  const [coords, setCoords] = useState({ lat: MAP_CENTER.lat, lng: MAP_CENTER.lng });
+  const [address, setAddress] = useState("");
+  const [region, setRegion] = useState("Colombo 07");
+  const [deviceIdError, setDeviceIdError] = useState("");
+  const [pairingError, setPairingError] = useState("");
+  const [claiming, setClaiming] = useState<AnnouncedDevice | null>(null);
+  const [claimBusy, setClaimBusy] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [geo, setGeo] = useState<"idle" | "locating" | "granted" | "denied" | "unavailable">("idle");
+  const [pinned, setPinned] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const params = useLocalSearchParams<{ deviceId?: string; pairingCode?: string }>();
+
+  // Returning from the in-app provisioning flow prefills the device fields —
+  // and if that device already announced itself, go straight to claim mode.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: sync nav params into form state
+    if (params.deviceId) setDeviceId(String(params.deviceId));
+    if (params.pairingCode) setPairingCode(String(params.pairingCode));
+  }, [params.deviceId, params.pairingCode]);
+
+  useEffect(() => {
+    if (!deviceId || claiming) return;
+    const dev = announced.find((d) => d.deviceId === deviceId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: announce list arriving after params fill
+    if (dev) setClaiming(dev);
+  }, [announced, deviceId, claiming]);
+
+  const myBins = bins.filter((b) => b.submittedBy === user?.id || b.citizenId === user?.id);
+
+  // A bin is offline when it misses ~2 telemetry cycles (firmware pings every 15 min).
+  const binOffline = (bin: (typeof bins)[number]) =>
+    // eslint-disable-next-line react-hooks/purity -- deliberate snapshot: staleness relative to render time
+    !bin.lastPingAt || Date.now() - new Date(bin.lastPingAt).getTime() > 40 * 60 * 1000;
+
+  const pinMyLocation = async () => {
+    setGeo("locating");
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== "granted") {
+      setGeo("denied");
+      return;
+    }
+    const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+    setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    setGeo("granted");
+    setPinned(true);
+    mapRef.current?.animateToRegion(
+      { latitude: pos.coords.latitude, longitude: pos.coords.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
+      400
+    );
+  };
+
+  // Pin automatically when permission was already granted before.
+  useEffect(() => {
+    Location.getForegroundPermissionsAsync().then(({ status }) => {
+      if (status === "granted") void pinMyLocation();
+      else setGeo("idle");
+    });
+  }, []);
+
+  const resetForm = () => {
+    setSubmitted(true);
+    setDeviceId("");
+    setPairingCode("");
+    setLabel("");
+    setAddress("");
+    setWasteType("Plastic");
+    setDeviceIdError("");
+    setPairingError("");
+    setClaiming(null);
+    setTimeout(() => setSubmitted(false), 4000);
+  };
+
+  const startClaim = (dev: AnnouncedDevice) => {
+    setClaiming(dev);
+    setDeviceId(dev.deviceId);
+    setPairingCode("");          // user types the code shown on the device portal
+    setDeviceIdError("");
+    setPairingError("");
+  };
+
+  // Paste of the portal's "device code" line — fills the form, and jumps to
+  // claim mode when the device already announced itself.
+  const handlePasteCode = (raw: string) => {
+    const parsed = parseDeviceCode(raw);
+    if (!parsed) return;
+    setDeviceId(parsed.deviceId);
+    setDeviceIdError("");
+    setPairingCode(parsed.pairingCode);
+    const dev = announced.find((d) => d.deviceId === parsed.deviceId);
+    if (dev) setClaiming(dev);
+  };
+
+  const handleSubmit = async () => {
+    if (claiming) {
+      if (!pairingCode.trim()) {
+        setPairingError("Enter the pairing code shown on the device setup page");
+        return;
+      }
+      if (!label.trim() || !user) return;
+      setClaimBusy(true);
+      const r = await claimDevice({
+        deviceId: claiming.deviceId,
+        pairingCode: pairingCode.trim(),
+        label,
+        lat: coords.lat,
+        lng: coords.lng,
+        address: address || `${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}`,
+        sizeL,
+        region,
+        wasteType,
+      });
+      setClaimBusy(false);
+      if (r.ok) { resetForm(); return; }
+      setPairingError(
+        r.error === "wrong_code" ? "That code doesn't match the device — check the setup page." :
+        r.error === "not_announced" ? "Device hasn't checked in yet — connect it to WiFi first." :
+        r.error === "already_registered" ? "This device is already registered." :
+        "Claim failed — try again."
+      );
+      return;
+    }
+
+    if (!deviceId.trim()) {
+      setDeviceIdError("Device ID is required");
+      return;
+    }
+    if (bins.some((b) => b.deviceId === deviceId)) {
+      setDeviceIdError("Device ID already exists in the system");
+      return;
+    }
+    if (!label.trim() || !user) return;
+
+    submitBin({
+      deviceId,
+      label,
+      lat: coords.lat,
+      lng: coords.lng,
+      address: address || `${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}`,
+      sizeL,
+      fillPct: 0,
+      isPublic: true,
+      region,
+      wasteType,
+      submittedBy: user.id,
+      ...(pairingCode ? { pairingCode } : {}),
+    });
+
+    resetForm();
+  };
+
+  return (
+    <>
+    <ScrollView keyboardShouldPersistTaps="handled" className="flex-1 bg-background" contentContainerClassName="p-4 pb-8">
+      <Text className="text-2xl font-bold text-foreground">Register a Smart Bin</Text>
+      <Text className="mb-4 text-muted-foreground">
+        Submit a new smart bin for admin approval. Pin the location on the map or use your current position.
+      </Text>
+
+      {submitted && (
+        <View className="mb-4 flex-row items-center gap-3 rounded-xl border border-sapphire-500/30 bg-sapphire-500/10 p-4">
+          <CheckCircle2 size={20} color="#0099FF" />
+          <View className="flex-1">
+            <Text className="font-medium text-foreground">Bin submitted for approval!</Text>
+            <Text className="text-sm text-muted-foreground">
+              An admin will review your registration.
+            </Text>
+          </View>
+        </View>
+      )}
+
+      <Card className="border-emerald-500/25">
+        <CardContent className="gap-3 p-4">
+          <View className="flex-row items-center justify-between gap-3">
+            <View className="min-w-0 flex-1">
+              <Text className="font-semibold text-foreground">Setting up a new bin?</Text>
+              <Text className="text-sm text-muted-foreground">
+                Tap &quot;Set up device&quot; — or paste the device code shown on the bin&apos;s setup page.
+              </Text>
+            </View>
+            <Button onPress={() => router.push("/citizen/provision")} variant="outline" className="border-emerald-500/40">
+              <Zap size={16} color="#16a34a" />
+              <Text className="text-sm font-semibold text-emerald-600">Set up device</Text>
+            </Button>
+          </View>
+          <Input
+            placeholder="Paste device code — ESP32-XXXXXX|BINC-XXXXXX"
+            autoCapitalize="characters"
+            onChangeText={handlePasteCode}
+          />
+        </CardContent>
+      </Card>
+
+      {announced.length > 0 && (
+        <Card className="mt-4 border-sapphire-500/25">
+          <CardHeader>
+            <View className="flex-row items-center gap-2">
+              <Wifi size={18} color="#0099FF" />
+              <CardTitle>Devices ready to claim</CardTitle>
+            </View>
+            <CardDescription>
+              These bins checked in over WiFi but aren&apos;t registered yet — tap yours, then enter the pairing code from its setup page.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="gap-2">
+            {announced.map((dev) => {
+              const active = claiming?.deviceId === dev.deviceId;
+              return (
+                <View
+                  key={dev.deviceId}
+                  className={`flex-row items-center justify-between rounded-xl border p-3 ${active ? "border-sapphire-500 bg-sapphire-500/5" : "border-border"}`}
+                >
+                  <View className="flex-1">
+                    <Text className="font-mono font-medium text-foreground">{dev.deviceId}</Text>
+                    <Text className="text-xs text-muted-foreground">
+                      {dev.binHeightCm ? `height ${dev.binHeightCm.toFixed(1)} cm • ` : ""}
+                      last seen {new Date(dev.lastSeenAt).toLocaleTimeString()}
+                    </Text>
+                  </View>
+                  <Button size="sm" variant={active ? "default" : "outline"} onPress={() => (active ? setClaiming(null) : startClaim(dev))}>
+                    <Text className={`text-sm font-semibold ${active ? "text-white" : "text-foreground"}`}>
+                      {active ? "Claiming…" : "This is my bin"}
+                    </Text>
+                  </Button>
+                </View>
+              );
+            })}
+          </CardContent>
+        </Card>
+      )}
+
+      <Card className="mt-4">
+        <CardHeader>
+          <View className="flex-row items-center gap-2">
+            <Plus size={18} color="#0099FF" />
+            <CardTitle>Bin Details</CardTitle>
+          </View>
+          <CardDescription>Fill in the ESP32 device info and bin specifications</CardDescription>
+        </CardHeader>
+        <CardContent className="gap-4">
+          {(geo === "idle" || geo === "denied" || geo === "unavailable") && (
+            <View className="rounded-xl border border-sapphire-500/25 bg-sapphire-500/5 p-3">
+              <View className="flex-row items-center gap-2">
+                <Crosshair size={16} color="#0099FF" />
+                <View className="flex-1">
+                  <Text className="text-sm font-medium text-foreground">
+                    {geo === "denied" ? "Location access blocked" : "Pin your bin at your current location"}
+                  </Text>
+                  <Text className="text-xs text-muted-foreground">
+                    {geo === "denied"
+                      ? "Allow location in your device settings, or set coordinates manually."
+                      : "Allow location access and we'll pin it for you."}
+                  </Text>
+                </View>
+                <Button size="sm" variant="outline" onPress={pinMyLocation}>
+                  <Text className="text-sm font-medium text-foreground">Enable</Text>
+                </Button>
+              </View>
+            </View>
+          )}
+          {geo === "granted" && pinned && (
+            <View className="flex-row items-center gap-2 rounded-xl border border-green-500/30 bg-green-500/10 p-3">
+              <CheckCircle2 size={16} color="#16a34a" />
+              <Text className="flex-1 text-sm text-green-700 dark:text-green-400">
+                Pinned to your current location — adjust on the map below.
+              </Text>
+            </View>
+          )}
+
+          <View className="gap-2">
+            <Label>ESP32 Device ID *</Label>
+            <View className="flex-row gap-2">
+              <View className="flex-1">
+                <Input
+                  value={deviceId}
+                  onChangeText={(t) => { setDeviceId(t); setDeviceIdError(""); }}
+                  placeholder="ESP32-XXXXXX"
+                  autoCapitalize="characters"
+                  editable={!claiming}
+                />
+              </View>
+              {!claiming && (
+                <Button
+                  variant="outline"
+                  onPress={async () => {
+                    if (!cameraPermission?.granted) {
+                      const res = await requestCameraPermission();
+                      if (!res.granted) return;
+                    }
+                    setScanning(true);
+                  }}
+                >
+                  <QrCode size={16} color="#0099FF" />
+                  <Text className="text-sm font-medium text-foreground">Scan QR</Text>
+                </Button>
+              )}
+            </View>
+            {deviceIdError ? <Text className="text-xs text-destructive">{deviceIdError}</Text> : null}
+            {claiming && (
+              <Text className="text-xs text-muted-foreground">
+                {claiming.binHeightCm
+                  ? `Sensor-measured empty height: ${claiming.binHeightCm.toFixed(1)} cm — verify this matches your bin.`
+                  : "Not calibrated yet — the device reports its height after setup."}
+              </Text>
+            )}
+            {claiming && (
+              <View className="gap-2">
+                <Label>Pairing code *</Label>
+                <Input
+                  value={pairingCode}
+                  onChangeText={(t) => { setPairingCode(t); setPairingError(""); }}
+                  placeholder="BINC-XXXXXX — shown on the device setup page"
+                  autoCapitalize="characters"
+                />
+                {pairingError ? <Text className="text-xs text-destructive">{pairingError}</Text> : null}
+              </View>
+            )}
+            {!claiming && pairingCode ? (
+              <View className="flex-row items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/10 p-2">
+                <ShieldCheck size={14} color="#16a34a" />
+                <Text className="text-xs text-green-700 dark:text-green-400">
+                  Paired — this bin telemetry is locked to your registration
+                </Text>
+              </View>
+            ) : null}
+          </View>
+
+          <View className="gap-2">
+            <Label>Bin Label *</Label>
+            <Input value={label} onChangeText={setLabel} placeholder="e.g., Home Plastic Bin" />
+          </View>
+
+          <View className="flex-row gap-3">
+            <View className="flex-1 gap-2">
+              <Label>Bin Size</Label>
+              <View className="flex-row gap-1">
+                {BIN_SIZES.map((s) => (
+                  <Pressable
+                    key={s}
+                    onPress={() => setSizeL(s)}
+                    className={`flex-1 items-center rounded-lg border py-2 ${sizeL === s ? "border-sapphire-500 bg-sapphire-500/10" : "border-border"}`}
+                  >
+                    <Text className={`text-sm ${sizeL === s ? "font-semibold text-sapphire-500" : "text-muted-foreground"}`}>{s}L</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          </View>
+
+          <View className="gap-2">
+            <Label>Waste Type</Label>
+            <View className="flex-row flex-wrap gap-2">
+              {WASTAGE_TYPES.map((wt) => (
+                <Pressable
+                  key={wt}
+                  onPress={() => setWasteType(wt)}
+                  className={`w-[48%] flex-row items-center gap-2 rounded-xl border-2 p-3 ${
+                    wasteType === wt ? "border-sapphire-500 bg-sapphire-500/10" : "border-border"
+                  }`}
+                >
+                  <Text className="text-lg">{WASTAGE_META[wt].icon}</Text>
+                  <Text className={`text-sm ${wasteType === wt ? "font-semibold text-sapphire-500" : "text-foreground"}`}>
+                    {wt}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
+          <View className="gap-2">
+            <Label>Address (optional)</Label>
+            <Input value={address} onChangeText={setAddress} placeholder="Street address — defaults to coordinates" />
+          </View>
+
+          <View className="gap-2">
+            <Label>Region</Label>
+            <Input value={region} onChangeText={setRegion} placeholder="Colombo 07" />
+          </View>
+
+          <Button onPress={() => void handleSubmit()} disabled={claimBusy} size="lg" className="bg-sapphire-500">
+            <Plus size={18} color="#ffffff" />
+            <Text className="text-base font-semibold text-white">
+              {claiming ? (claimBusy ? "Verifying code…" : "Claim Device & Submit") : "Submit for Approval"}
+            </Text>
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card className="mt-4">
+        <CardHeader>
+          <View className="flex-row items-center gap-2">
+            <MapPin size={18} color="#0099FF" />
+            <CardTitle>Pin Bin Location</CardTitle>
+          </View>
+          <CardDescription>Tap the map to set the bin&apos;s GPS coordinates</CardDescription>
+        </CardHeader>
+        <CardContent className="gap-3">
+          <View className="overflow-hidden rounded-xl border border-border">
+            <MapView
+              ref={mapRef}
+              style={{ height: 250, width: "100%" }}
+              initialRegion={{ latitude: coords.lat, longitude: coords.lng, latitudeDelta: 0.02, longitudeDelta: 0.02 }}
+              onPress={(e) => {
+                setCoords({ lat: e.nativeEvent.coordinate.latitude, lng: e.nativeEvent.coordinate.longitude });
+                setPinned(true);
+              }}
+              showsUserLocation
+            >
+              {pinned && <Marker coordinate={{ latitude: coords.lat, longitude: coords.lng }} pinColor="#0099FF" />}
+            </MapView>
+          </View>
+          <Button variant="outline" onPress={pinMyLocation} disabled={geo === "locating"}>
+            <Crosshair size={16} color="#8fa3b8" />
+            <Text className="text-sm font-medium text-foreground">
+              {geo === "locating" ? "Locating…" : "Use My Current Location"}
+            </Text>
+          </Button>
+          <View className="flex-row items-center gap-2">
+            <Info size={14} color="#0099FF" />
+            <Text className="text-sm text-muted-foreground">
+              Selected: <Text className="font-mono font-medium text-foreground">{coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</Text>
+            </Text>
+          </View>
+        </CardContent>
+      </Card>
+
+      {myBins.length > 0 && (
+        <Card className="mt-4">
+          <CardHeader>
+            <CardTitle>My Submitted Bins</CardTitle>
+            <CardDescription>Tap a bin to edit details, location or height — edits go back to admin review</CardDescription>
+          </CardHeader>
+          <CardContent className="gap-2">
+            {myBins.map((bin) => (
+              <Pressable
+                key={bin.id}
+                onPress={() => router.push(`/citizen/edit-bin/${bin.id}`)}
+                className="flex-row items-center justify-between gap-2 rounded-xl border border-border p-3"
+              >
+                <View className="flex-1 flex-row items-center gap-3">
+                  <View className="h-9 w-9 items-center justify-center rounded-lg bg-primary/10">
+                    <MapPin size={16} color="#0099FF" />
+                  </View>
+                  <View className="flex-1">
+                    <Text className="text-sm font-medium text-foreground">{bin.label}</Text>
+                    <Text className="text-xs text-muted-foreground">
+                      {bin.deviceId} • {bin.sizeL}L • {bin.region}
+                    </Text>
+                  </View>
+                </View>
+                {bin.approvalStatus === "pending" && (
+                  <Badge variant="outline" className="border-amber-500/40">
+                    <Text className="text-xs text-amber-600 dark:text-amber-400">⏳ Pending</Text>
+                  </Badge>
+                )}
+                {bin.approvalStatus === "approved" && !binOffline(bin) && (
+                  <Badge variant="outline" className="border-green-500/40">
+                    <Text className="text-xs text-green-600 dark:text-green-400">✓ Approved</Text>
+                  </Badge>
+                )}
+                {bin.approvalStatus === "approved" && binOffline(bin) && (
+                  <Pressable
+                    onPress={() =>
+                      router.push({
+                        pathname: "/citizen/provision",
+                        params: { deviceId: bin.deviceId, pairingCode: bin.pairingCode ?? "", mode: "reconfigure" },
+                      })
+                    }
+                    className="flex-row items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5"
+                  >
+                    <WifiOff size={12} color="#e5484d" />
+                    <Text className="text-xs font-semibold text-destructive">Offline — reconnect</Text>
+                  </Pressable>
+                )}
+                {bin.approvalStatus === "rejected" && (
+                  <Badge variant="outline" className="border-red-500/40">
+                    <Text className="text-xs text-destructive">Rejected</Text>
+                  </Badge>
+                )}
+                <Pencil size={14} color="#8fa3b8" />
+              </Pressable>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+    </ScrollView>
+
+      <Modal visible={scanning} animationType="slide" onRequestClose={() => setScanning(false)}>
+        <View className="flex-1 bg-black">
+          <View className="flex-row items-center justify-between px-4 pt-14 pb-3">
+            <View>
+              <Text className="text-lg font-semibold text-white">Scan the bin QR sticker</Text>
+              <Text className="text-xs text-white/60">Fills the device ID and pairing code</Text>
+            </View>
+            <Pressable onPress={() => setScanning(false)} className="rounded-full bg-white/10 p-2">
+              <X size={20} color="#ffffff" />
+            </Pressable>
+          </View>
+          {cameraPermission?.granted ? (
+            <CameraView
+              style={{ flex: 1 }}
+              barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+              onBarcodeScanned={({ data }) => {
+                const parsed = parseDeviceQr(data);
+                if (!parsed) return;
+                setDeviceId(parsed.deviceId);
+                setPairingCode(parsed.pairingCode);
+                setDeviceIdError("");
+                setScanning(false);
+              }}
+            />
+          ) : (
+            <View className="flex-1 items-center justify-center p-6">
+              <Text className="text-center text-sm text-white/70">Camera permission is needed to scan the bin sticker.</Text>
+              <Button className="mt-3" onPress={() => requestCameraPermission()}>
+                <Text className="text-sm font-semibold text-white">Allow Camera</Text>
+              </Button>
+            </View>
+          )}
+          <View className="items-center px-6 pb-10 pt-3">
+            <Text className="text-center text-xs text-white/50">
+              The sticker looks like: BINCOIN|ESP32-A1B2C3|PAIR-XXXXXX — point the camera at the bin QR.
+            </Text>
+          </View>
+        </View>
+      </Modal>
+    </>
+  );
+}
